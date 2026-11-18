@@ -6,6 +6,10 @@
 - 相同日期 + 相同站点集合(与顺序、重复无关)复用原结果, 不再扣费
 - 首个成功查询锁定当天源数据, 之后拒绝替换
 - 扣费 / 保存结果 / 锁定源数据在同一事务中, 要么全部成功要么全部不生效
+- 乘客可撤回首程数据授权: 单事务移除该人在所有日期的源明细并登记撤回;
+  已锁定日期同样撤回, 但历史加噪结果、预算与锁定状态保持不变;
+  撤回后任何整日 CSV 只要含该 ID 即整批拒绝, 原数据不变;
+  重复撤回幂等, 不再改变数据
 """
 
 import csv
@@ -28,6 +32,9 @@ NOISE_SCALE = 2.0    # Laplace(0, 2)
 
 app = Flask(__name__)
 _rng = secrets.SystemRandom()  # 安全随机源
+
+# 测试钩子: 若非 None, 写事务提交前会调用它(用于模拟提交阶段失败/重启)
+commit_failure_hook = None
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS passengers (
@@ -54,6 +61,23 @@ CREATE TABLE IF NOT EXISTS queries (
     created_at   TEXT NOT NULL,
     PRIMARY KEY (date, in_key, out_key)
 );
+
+-- 授权撤回登记: 每个乘客最多一条, 存在即表示已撤回(重复撤回幂等)
+CREATE TABLE IF NOT EXISTS withdrawals (
+    passenger_id TEXT PRIMARY KEY,
+    created_at   TEXT NOT NULL
+);
+
+-- 撤回影响明细: 每次撤回在每个受影响日期删除的源明细行数(审计/页面回查)
+CREATE TABLE IF NOT EXISTS withdrawal_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    passenger_id TEXT NOT NULL,
+    date         TEXT NOT NULL,
+    deleted_rows INTEGER NOT NULL,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_withdrawal_log_pid
+    ON withdrawal_log (passenger_id, id);
 """
 
 
@@ -235,6 +259,20 @@ def upload():
     conn = get_db()
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # 含已撤回乘客 ID 的 CSV 整批拒绝, 原数据保持不变(检查先于任何写操作)
+        incoming_ids = sorted({pid for pid, _in, _out in rows})
+        placeholders = ",".join("?" for _ in incoming_ids)
+        blocked = [r["passenger_id"] for r in conn.execute(
+            f"SELECT passenger_id FROM withdrawals"
+            f" WHERE passenger_id IN ({placeholders})",
+            incoming_ids).fetchall()]
+        if blocked:
+            conn.execute("ROLLBACK")
+            return jsonify(ok=False,
+                           error="CSV 含已撤回授权的乘客, 整批拒绝: "
+                                 + "、".join(blocked),
+                           withdrawn_ids=blocked), 422
+
         state = conn.execute(
             "SELECT locked FROM day_state WHERE date = ?", (date,)).fetchone()
         if state and state["locked"]:
@@ -342,7 +380,111 @@ def query():
                    budget_remaining=round(DAILY_BUDGET - spent - QUERY_COST, 10))
 
 
+# ---------------------------------------------------------------- 授权撤回
+
+@app.post("/withdraw")
+def withdraw():
+    """撤回首程数据使用授权.
+
+    单个 BEGIN IMMEDIATE 事务内完成:
+      1. 登记撤回(withdrawals, 已登记则整请求幂等返回, 不改任何数据);
+      2. 删除该乘客在所有日期的源明细(passengers), 已锁定日期同样删除;
+      3. 按日期登记删除行数(withdrawal_log), 供页面展示与回查.
+    历史加噪结果(queries)、预算(budget_spent)与锁定状态(locked)一律不变。
+    事务要么整体提交, 要么整体回滚, 不会留下部分日期已移除的中间状态。
+    """
+    payload = get_payload()
+    pid = (payload.get("passenger_id") or "").strip()
+    if not pid:
+        return jsonify(ok=False, error="乘客ID 不能为空"), 400
+
+    conn = get_db()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT created_at FROM withdrawals WHERE passenger_id = ?",
+            (pid,)).fetchone()
+        if existing:
+            # 重复撤回: 幂等, 数据不再变化
+            conn.execute("COMMIT")
+            log_rows = conn.execute(
+                "SELECT date, deleted_rows, created_at FROM withdrawal_log"
+                " WHERE passenger_id = ? ORDER BY id", (pid,)).fetchall()
+            affected = [{"date": r["date"], "deleted_rows": r["deleted_rows"]}
+                        for r in log_rows]
+            return jsonify(ok=True, passenger_id=pid, already_withdrawn=True,
+                           affected_dates=affected,
+                           total_deleted_rows=sum(r["deleted_rows"] for r in log_rows),
+                           withdrawn_at=existing["created_at"],
+                           message=f"乘客 {pid} 此前已撤回授权, 本次未改动任何数据")
+
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO withdrawals (passenger_id, created_at) VALUES (?, ?)",
+            (pid, now))
+
+        # 该乘客在每个日期至多一行(PK date,passenger_id), 逐日期删除并记录行数
+        dates = [r["date"] for r in conn.execute(
+            "SELECT DISTINCT date FROM passengers WHERE passenger_id = ?"
+            " ORDER BY date", (pid,)).fetchall()]
+        affected = []
+        total = 0
+        for d in dates:
+            cur = conn.execute(
+                "DELETE FROM passengers WHERE date = ? AND passenger_id = ?",
+                (d, pid))
+            deleted = cur.rowcount
+            conn.execute(
+                "INSERT INTO withdrawal_log (passenger_id, date, deleted_rows,"
+                " created_at) VALUES (?, ?, ?, ?)",
+                (pid, d, deleted, now))
+            affected.append({"date": d, "deleted_rows": deleted})
+            total += deleted
+        if commit_failure_hook is not None:  # 测试钩子: 模拟提交阶段故障
+            commit_failure_hook()
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+
+    return jsonify(ok=True, passenger_id=pid, already_withdrawn=False,
+                   affected_dates=affected, total_deleted_rows=total,
+                   withdrawn_at=now,
+                   message=(f"已登记乘客 {pid} 的撤回, 并从 {len(affected)} 个日期"
+                            f"删除源明细共 {total} 行; 历史加噪结果、预算与锁定状态不变"))
+
+
 # ---------------------------------------------------------------- 状态接口
+
+@app.get("/api/withdrawals")
+def api_withdrawals():
+    """撤回登记列表, 含每个乘客受影响日期与删除行数(可按 passenger_id 过滤)."""
+    conn = get_db()
+    pid = (request.args.get("passenger_id") or "").strip()
+    if pid:
+        wrows = conn.execute(
+            "SELECT passenger_id, created_at FROM withdrawals"
+            " WHERE passenger_id = ? ORDER BY created_at", (pid,)).fetchall()
+    else:
+        wrows = conn.execute(
+            "SELECT passenger_id, created_at FROM withdrawals"
+            " ORDER BY created_at").fetchall()
+    result = []
+    for w in wrows:
+        logs = conn.execute(
+            "SELECT date, deleted_rows FROM withdrawal_log"
+            " WHERE passenger_id = ? ORDER BY id",
+            (w["passenger_id"],)).fetchall()
+        result.append({
+            "passenger_id": w["passenger_id"],
+            "withdrawn_at": w["created_at"],
+            "affected_dates": [{"date": r["date"], "deleted_rows": r["deleted_rows"]}
+                               for r in logs],
+            "total_deleted_rows": sum(r["deleted_rows"] for r in logs),
+        })
+    return jsonify(ok=True, withdrawals=result)
+
 
 @app.get("/api/stations")
 def api_stations():

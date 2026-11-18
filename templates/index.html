@@ -18,7 +18,7 @@
             box-shadow: 0 1px 3px rgba(15, 76, 129, .12); }
   h2 { margin: 0 0 12px; font-size: 17px; color: #0f4c81; }
   label { display: block; font-size: 13px; margin: 10px 0 4px; color: #52606d; }
-  input[type=date], input[type=file], select {
+  input[type=date], input[type=file], input[type=text], select {
     width: 100%; padding: 8px; border: 1px solid #cbd2d9; border-radius: 6px;
     font-size: 14px; background: #fff; }
   select[multiple] { min-height: 120px; }
@@ -85,6 +85,27 @@
     <div class="badges" id="statusBadges"></div>
     <table id="historyTable">
       <thead><tr><th>#</th><th>进站集合</th><th>出站集合</th><th>加噪人数</th><th>发布时间(UTC)</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="hint">历史加噪结果按原值回查, 与授权撤回无关; 撤回不改变预算与锁定状态。</div>
+  </section>
+
+  <section>
+    <h2>④ 撤回首程数据使用授权(输入乘客ID, 移除其所有日期的源明细并登记)</h2>
+    <form id="withdrawForm">
+      <label for="wdPid">乘客ID</label>
+      <input type="text" id="wdPid" placeholder="例如:p3" required>
+      <button type="submit">登记撤回并删除源明细</button>
+    </form>
+    <div class="msg" id="withdrawMsg"></div>
+    <div class="result" id="withdrawResult"></div>
+    <div class="hint">已锁定日期同样撤回; 历史加噪结果仍按原值回查, 预算与锁定状态不变。此后任何整日 CSV 只要含该 ID 即整批拒绝。重复撤回不再改变数据。</div>
+  </section>
+
+  <section>
+    <h2>⑤ 撤回登记与影响回查(受影响日期 / 删除行数)</h2>
+    <table id="withdrawalTable">
+      <thead><tr><th>乘客ID</th><th>撤回时间(UTC)</th><th>受影响日期与删除行数</th><th>删除总行数</th></tr></thead>
       <tbody></tbody>
     </table>
   </section>
@@ -174,9 +195,60 @@ $("queryBtn").addEventListener("click", async () => {
 });
 
 $("qDate").addEventListener("change", () => { refreshStations(); refreshStatus(); });
+
+async function refreshWithdrawals() {
+  const res = await fetch("/api/withdrawals");
+  const data = await res.json();
+  const tbody = $("withdrawalTable").querySelector("tbody");
+  tbody.innerHTML = "";
+  if (!data.ok) return;
+  if (data.withdrawals.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="4" style="color:#7b8794">暂无撤回登记</td></tr>`;
+    return;
+  }
+  data.withdrawals.forEach(w => {
+    const detail = w.affected_dates.length
+      ? w.affected_dates.map(a => `${a.date}（删 ${a.deleted_rows} 行）`).join("；")
+      : "无源明细（0 行）";
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${w.passenger_id}</td><td>${w.withdrawn_at}</td>` +
+      `<td>${detail}</td><td>${w.total_deleted_rows}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+$("withdrawForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const res = await fetch("/withdraw", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ passenger_id: $("wdPid").value }),
+  });
+  const data = await res.json();
+  const msg = $("withdrawMsg"), out = $("withdrawResult");
+  if (data.ok) {
+    msg.className = "msg"; msg.style.display = "none";
+    out.style.display = "block";
+    const detail = data.affected_dates.length
+      ? data.affected_dates.map(a => `${a.date}：删除 ${a.deleted_rows} 行`).join("<br>")
+      : "没有受影响日期（该乘客无现存源明细）";
+    out.innerHTML =
+      `<div>乘客 <b>${data.passenger_id}</b> ${data.already_withdrawn ? "此前已撤回（本次幂等，未改动数据）" : "撤回成功"}</div>` +
+      `<div class="hint">受影响日期 ${data.affected_dates.length} 个，删除源明细共 <b>${data.total_deleted_rows}</b> 行</div>` +
+      `<div class="hint">${detail}</div>` +
+      `<div class="hint">历史加噪结果、预算与锁定状态不变; 含该 ID 的整日 CSV 今后将被整批拒绝。</div>`;
+  } else {
+    out.style.display = "none";
+    showMsg(msg, "撤回失败:" + data.error, false);
+  }
+  refreshWithdrawals();
+  refreshStations();
+  refreshStatus();
+});
+
 const today = new Date().toISOString().slice(0, 10);
 $("upDate").value = today; $("qDate").value = today;
-refreshStations(); refreshStatus();
+refreshStations(); refreshStatus(); refreshWithdrawals();
 </script>
 </body>
 </html>
